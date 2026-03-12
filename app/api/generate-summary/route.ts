@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import type { ConversationSummary } from '@/types/conversation';
+import { getUserAISettings, getAIModel } from '@/lib/ai-provider';
+import { generateText, LanguageModel } from 'ai';
 
 export const runtime = 'nodejs';
 
@@ -32,10 +34,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json({ error: 'Service configuration error' }, { status: 503 });
-    }
+    const aiSettings = await getUserAISettings(supabase, user.id);
+    const modelInfo = aiSettings.summary;
 
     const body: SummaryRequest = await request.json();
     const { documentId, currentSummary, lastExchanges, interactionCount } = body;
@@ -52,35 +52,22 @@ export async function POST(request: Request) {
       ? `Previous summary:\n${JSON.stringify(currentSummary, null, 2)}\n\nNew exchanges to incorporate:\n${exchangesText}\n\nUpdate the summary to include these new interactions. Set interaction_count to ${interactionCount}.`
       : `First exchange:\n${exchangesText}\n\nCreate an initial summary. Set interaction_count to ${interactionCount}.`;
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-3-5-haiku-20241022',
-        max_tokens: 1024,
-        system: SUMMARY_PROMPT,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-
-    if (!response.ok) {
-      console.error('Summary generation failed:', await response.text());
-      return NextResponse.json({ error: 'Summary generation failed' }, { status: 500 });
-    }
-
-    const result = await response.json();
-    const content = result.content?.[0]?.text || '';
-
     let summary: ConversationSummary;
+
     try {
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      const aiModel = getAIModel(modelInfo) as LanguageModel;
+      const { text } = await generateText({
+        model: aiModel,
+        system: SUMMARY_PROMPT,
+        prompt: prompt,
+        maxTokens: 1024,
+      });
+
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (!jsonMatch) throw new Error('No JSON found');
       summary = JSON.parse(jsonMatch[0]);
-    } catch {
+    } catch (err) {
+      console.error('Summary generation failed with AI:', err);
       if (currentSummary) {
         summary = {
           ...currentSummary,

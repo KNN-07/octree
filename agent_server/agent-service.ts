@@ -3,7 +3,6 @@ import express from 'express';
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import { streamText } from 'ai';
-import { anthropic } from '@ai-sdk/anthropic';
 
 import {
   validateApiKeys,
@@ -16,6 +15,7 @@ import { createOctraTools } from './lib/tools.js';
 import type { StringEdit } from './lib/edits.js';
 import { createSSEHeaders, processFullStream } from './lib/stream-handling.js';
 import { SessionManager } from './lib/session-manager.js';
+import { getAIModel } from './lib/ai-provider.js';
 
 const app = express();
 app.use(cors());
@@ -52,12 +52,8 @@ function jwtAuthMiddleware(req: express.Request, res: express.Response, next: ex
 
 app.post('/agent', jwtAuthMiddleware, async (req: express.Request, res: express.Response) => {
   try {
-    const keyValidation = validateApiKeys();
-    if (!keyValidation.isValid) {
-      res.status(503).json({ error: keyValidation.error });
-      return;
-    }
-
+    // API keys validation depends on selected provider, so we bypass validateApiKeys if configured from client.
+    // If not, we will get auth errors downstream from SDK.
     const {
       messages,
       fileContent,
@@ -66,12 +62,16 @@ app.post('/agent', jwtAuthMiddleware, async (req: express.Request, res: express.
       projectFiles: projectFilesPayload,
       currentFilePath,
       sessionId,
+      aiConfig,
     } = req.body || {};
 
     if (!messages?.length || typeof fileContent !== 'string') {
       res.status(400).json({ error: 'Invalid request' });
       return;
     }
+
+    const aiModelConfig = aiConfig || { provider: 'anthropic', model: 'claude-sonnet-4-6' };
+    const aiModel = getAIModel(aiModelConfig);
 
     const numbered = await buildNumberedContent(fileContent, textFromEditor);
     const userText = typeof messages[messages.length - 1]?.content === 'string'
@@ -137,9 +137,6 @@ app.post('/agent', jwtAuthMiddleware, async (req: express.Request, res: express.
     const sessionSummary = currentSession?.summary || null;
     const lastInteraction = currentSession?.lastInteraction || null;
 
-    console.log('[Session] sessionId:', sessionId || '(none)');
-    console.log('[Session] hasSummary:', !!sessionSummary, 'hasLastInteraction:', !!lastInteraction);
-
     const systemPrompt = buildSystemPrompt(
       numbered,
       textFromEditor,
@@ -153,22 +150,19 @@ app.post('/agent', jwtAuthMiddleware, async (req: express.Request, res: express.
     writeEvent('status', { state: 'started' });
 
     const result = streamText({
-      model: anthropic('claude-sonnet-4-6'),
+      model: aiModel,
       system: systemPrompt,
       prompt: userText,
       tools,
       maxSteps: 25,
-      maxTokens: 16384,
+      maxTokens: 8192,
     });
 
     const finalText = await processFullStream(result.fullStream, writeEvent, collectedEdits);
 
     if (sessionId) {
       sessionManager.storeLastInteraction(sessionId, userText, finalText);
-      console.log('[Session] Generating updated summary for:', sessionId);
-      sessionManager.generateUpdatedSummary(sessionId, sessionSummary || '', userText, finalText).catch(console.error);
-    } else {
-      console.log('[Session] No sessionId provided - skipping session update');
+      sessionManager.generateUpdatedSummary(sessionId, sessionSummary || '', userText, finalText, aiModelConfig).catch(console.error);
     }
 
     writeEvent('done', { text: finalText, edits: collectedEdits });

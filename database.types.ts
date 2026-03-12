@@ -221,6 +221,7 @@ export type Database = {
       }
       user_usage: {
         Row: {
+          ai_settings: Json | null
           cancel_at_period_end: boolean | null
           created_at: string | null
           current_period_end: string | null
@@ -242,6 +243,7 @@ export type Database = {
           user_id: string
         }
         Insert: {
+          ai_settings?: Json | null
           cancel_at_period_end?: boolean | null
           created_at?: string | null
           current_period_end?: string | null
@@ -263,6 +265,7 @@ export type Database = {
           user_id: string
         }
         Update: {
+          ai_settings?: Json | null
           cancel_at_period_end?: boolean | null
           created_at?: string | null
           current_period_end?: string | null

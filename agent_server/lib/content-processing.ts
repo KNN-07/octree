@@ -145,13 +145,7 @@ export function normalizeLineEndings(text: string): string {
 }
 
 export function validateApiKeys(): { isValid: boolean; error?: string } {
-  const hasAnthropic = !!process.env.ANTHROPIC_API_KEY;
-  if (!hasAnthropic) {
-    return {
-      isValid: false,
-      error: 'No Anthropic API key configured. Please set ANTHROPIC_API_KEY.',
-    };
-  }
+  // Now handled dynamically using user settings. Kept for backwards compatibility.
   return { isValid: true };
 }
 

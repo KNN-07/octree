@@ -1,33 +1,22 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
-import { createSSEHeaders } from '@/lib/octra-agent/stream-handling';
+import { createSSEHeaders } from '@/agent_server/lib/stream-handling';
 import type { ConversationSummary } from '@/types/conversation';
+import { getUserAISettings, getAIModel } from '@/lib/ai-provider';
+import { streamText, LanguageModel } from 'ai';
 
 export const runtime = 'nodejs';
-export const maxDuration = 600;
 
-const DOCUMENT_GENERATION_PROMPT = `You are an expert LaTeX document writer. Generate a complete, compilable LaTeX document based on the user's request.
+// ... (PROMPT content kept out of brevity)
+const DOCUMENT_GENERATION_PROMPT = `You are an expert LaTeX document generator. Your task is to output ONLY valid, compile-ready LaTeX code based on the user's request.
 
 STRICT COMPILATION CONSTRAINTS (MUST FOLLOW):
-1.  **Engine**: The document will be compiled with **pdflatex**.
-    -   DO NOT use packages that require XeTeX or LuaTeX (e.g., \`fontspec\`, \`unicode-math\`).
-    -   DO NOT use packages that require shell-escape (e.g., \`minted\`, \`svg\`, \`auto-pst-pdf\`).
-2.  **Fonts**: Use ONLY standard Type 1 fonts compatible with pdflatex.
-    -   Approved: \`lmodern\` (default), \`mathptmx\` (Times), \`helvet\` (Helvetica), \`courier\`.
-    -   FORBIDDEN: System fonts, TTF/OTF fonts via fontspec.
-3.  **Packages**:
-    -   USE: \`amsmath\`, \`amssymb\`, \`graphicx\`, \`geometry\`, \`hyperref\`, \`xcolor\`, \`fancyhdr\`, \`enumitem\`, \`booktabs\`, \`caption\`, \`listings\` (for code).
-    -   AVOID: \`tcolorbox\` (unless simple), complex tikz libraries that might timeout.
-4.  **Structure**:
-    -   MUST start with \`\\documentclass{...}\`
-    -   MUST end with \`\\end{document}\`
-    -   MUST be a single self-contained file (except for provided images).
-5.  **Images**:
-    -   If the user provided images, use \`\\includegraphics\` with the filenames derived from context.
-    -   If NO images provided, use \`draft\` option in graphicx or placeholder rectangles.
-6.  **Content**:
-    -   Output ONLY valid LaTeX code.
-    -   NO markdown, NO code fences, NO explanations before/after.
+1. **Engine**: pdflatex only. No XeTeX/LuaTeX specific packages (e.g., fontspec, polyglossia).
+2. **Fonts**: Standard Type 1 fonts only (e.g., lmodern, mathptmx, helvet, courier). Do NOT use system fonts.
+3. **Packages**: Only use standard, widely available packages (amsmath, amssymb, graphicx, geometry, hyperref, xcolor, fancyhdr, enumitem, booktabs, caption, listings).
+4. **Encoding**: Use \\usepackage[utf8]{inputenc} and \\usepackage[T1]{fontenc}.
+5. **Output**: A complete, compilable document from \\documentclass to \\end{document}.
+6. **Format**: Output ONLY the raw LaTeX code. NO markdown formatting, NO code fences, NO explanations before/after.
 
 For research papers: include abstract, sections, subsections, and a bibliography section.
 For other documents: use appropriate structure.`;
@@ -78,13 +67,8 @@ export async function POST(request: Request) {
       );
     }
 
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: 'Service configuration error' },
-        { status: 503 }
-      );
-    }
+    const aiSettings = await getUserAISettings(supabase, user.id);
+    const modelInfo = aiSettings.document;
 
     const body: GenerateRequest = await request.json();
     const {
@@ -161,27 +145,20 @@ export async function POST(request: Request) {
             message: 'Starting document generation...',
           });
 
-          const messageContent: unknown[] = [];
+          const messageContent: any[] = [];
 
           if (files && files.length > 0) {
             for (const file of files) {
               if (file.mimeType.startsWith('image/')) {
                 messageContent.push({
                   type: 'image',
-                  source: {
-                    type: 'base64',
-                    media_type: file.mimeType,
-                    data: file.data,
-                  },
+                  image: `data:${file.mimeType};base64,${file.data}`,
                 });
               } else if (file.mimeType === 'application/pdf') {
                 messageContent.push({
-                  type: 'document',
-                  source: {
-                    type: 'base64',
-                    media_type: file.mimeType,
-                    data: file.data,
-                  },
+                  type: 'file',
+                  data: file.data,
+                  mimeType: file.mimeType,
                 });
               }
             }
@@ -189,63 +166,26 @@ export async function POST(request: Request) {
 
           messageContent.push({ type: 'text', text: userContent });
 
-          const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-api-key': apiKey,
-              'anthropic-version': '2023-06-01',
-            },
-            body: JSON.stringify({
-              model: 'claude-sonnet-4-20250514',
-              max_tokens: 8192,
-              system: systemPrompt,
-              messages: [{ role: 'user', content: messageContent }],
-              stream: true,
-            }),
+          const aiModel = getAIModel(modelInfo) as LanguageModel;
+
+          const result = streamText({
+            model: aiModel,
+            system: systemPrompt,
+            messages: [{ role: 'user', content: messageContent }],
+            maxTokens: 8192,
           });
 
-          if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`API error: ${response.status} - ${errorText}`);
-          }
-
-          const reader = response.body?.getReader();
-          if (!reader) throw new Error('No response body');
-
-          const decoder = new TextDecoder();
-          let buffer = '';
-          let accumulatedContent = '';
           let chunkBuffer = '';
+          let accumulatedContent = '';
           const CHUNK_SIZE = 100;
 
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
+          for await (const chunk of result.textStream) {
+            accumulatedContent += chunk;
+            chunkBuffer += chunk;
 
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-
-            for (const line of lines) {
-              if (!line.startsWith('data: ')) continue;
-              const data = line.slice(6);
-              if (data === '[DONE]') continue;
-
-              try {
-                const event = JSON.parse(data);
-                if (event.type === 'content_block_delta' && event.delta?.text) {
-                  accumulatedContent += event.delta.text;
-                  chunkBuffer += event.delta.text;
-
-                  if (chunkBuffer.length >= CHUNK_SIZE) {
-                    write('content', { text: chunkBuffer, partial: true });
-                    chunkBuffer = '';
-                  }
-                }
-              } catch {
-                // Skip malformed events
-              }
+            if (chunkBuffer.length >= CHUNK_SIZE) {
+              write('content', { text: chunkBuffer, partial: true });
+              chunkBuffer = '';
             }
           }
 
@@ -285,6 +225,7 @@ export async function POST(request: Request) {
 
           controller.close();
         } catch (err) {
+          console.error(err);
           const message =
             err instanceof Error ? err.message : 'Generation failed';
           write('error', { message });

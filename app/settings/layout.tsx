@@ -2,13 +2,18 @@ import { redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
 import Navbar from '@/components/navbar';
 import { SidebarNav } from '@/components/settings/sidebar-nav';
-import { User, CreditCard } from 'lucide-react';
+import { User, CreditCard, Settings2 } from 'lucide-react';
 
 const sidebarNavItems = [
   {
     title: 'Account',
     href: '/settings/account',
     icon: <User className="h-4 w-4" />,
+  },
+  {
+    title: 'AI Settings',
+    href: '/settings/ai',
+    icon: <Settings2 className="h-4 w-4" />,
   },
   {
     title: 'Billing',

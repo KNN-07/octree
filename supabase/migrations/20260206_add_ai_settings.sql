@@ -1,0 +1,2 @@
+ALTER TABLE user_usage
+ADD COLUMN ai_settings JSONB DEFAULT NULL;
