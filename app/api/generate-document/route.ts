@@ -1,7 +1,13 @@
+import { streamText, type UserContent } from 'ai';
 import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { createSSEHeaders } from '@/lib/octra-agent/stream-handling';
 import type { ConversationSummary } from '@/types/conversation';
+import {
+  AiConfigurationError,
+  createAiModel,
+  parseAiProviderConfig,
+} from '@/lib/ai/provider';
 
 export const runtime = 'nodejs';
 export const maxDuration = 600;
@@ -61,6 +67,7 @@ interface GenerateRequest {
   conversationSummary?: ConversationSummary | null;
   lastUserPrompt?: string | null;
   lastAssistantResponse?: string | null;
+  aiSettings?: unknown;
 }
 
 export async function POST(request: Request) {
@@ -78,14 +85,6 @@ export async function POST(request: Request) {
       );
     }
 
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: 'Service configuration error' },
-        { status: 503 }
-      );
-    }
-
     const body: GenerateRequest = await request.json();
     const {
       prompt,
@@ -97,6 +96,12 @@ export async function POST(request: Request) {
       lastUserPrompt,
       lastAssistantResponse,
     } = body;
+
+    const aiConfig = parseAiProviderConfig(body.aiSettings, {
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-6',
+    });
+    const model = createAiModel(aiConfig);
 
     if (!prompt?.trim()) {
       return NextResponse.json(
@@ -115,14 +120,20 @@ export async function POST(request: Request) {
       systemPrompt = CONTINUATION_PROMPT;
 
       const contextParts: string[] = [];
-      contextParts.push(`CURRENT DOCUMENT:\n\`\`\`latex\n${currentLatex}\n\`\`\``);
+      contextParts.push(
+        `CURRENT DOCUMENT:\n\`\`\`latex\n${currentLatex}\n\`\`\``
+      );
 
       if (conversationSummary) {
-        contextParts.push(`\nCONVERSATION CONTEXT:\n- Original intent: ${conversationSummary.original_intent}\n- Modifications made: ${conversationSummary.modifications_made.join(', ') || 'None yet'}\n- Current state: ${conversationSummary.current_state}`);
+        contextParts.push(
+          `\nCONVERSATION CONTEXT:\n- Original intent: ${conversationSummary.original_intent}\n- Modifications made: ${conversationSummary.modifications_made.join(', ') || 'None yet'}\n- Current state: ${conversationSummary.current_state}`
+        );
       }
 
       if (lastUserPrompt && lastAssistantResponse) {
-        contextParts.push(`\nLAST EXCHANGE:\nUser asked: ${lastUserPrompt}\nResult: Document was updated accordingly.`);
+        contextParts.push(
+          `\nLAST EXCHANGE:\nUser asked: ${lastUserPrompt}\nResult: Document was updated accordingly.`
+        );
       }
 
       contextParts.push(`\nNEW REQUEST:\n${prompt}`);
@@ -161,27 +172,22 @@ export async function POST(request: Request) {
             message: 'Starting document generation...',
           });
 
-          const messageContent: unknown[] = [];
+          const messageContent: UserContent = [];
 
           if (files && files.length > 0) {
             for (const file of files) {
               if (file.mimeType.startsWith('image/')) {
                 messageContent.push({
                   type: 'image',
-                  source: {
-                    type: 'base64',
-                    media_type: file.mimeType,
-                    data: file.data,
-                  },
+                  image: file.data,
+                  mediaType: file.mimeType,
                 });
               } else if (file.mimeType === 'application/pdf') {
                 messageContent.push({
-                  type: 'document',
-                  source: {
-                    type: 'base64',
-                    media_type: file.mimeType,
-                    data: file.data,
-                  },
+                  type: 'file',
+                  data: file.data,
+                  mediaType: file.mimeType,
+                  filename: file.name,
                 });
               }
             }
@@ -189,63 +195,24 @@ export async function POST(request: Request) {
 
           messageContent.push({ type: 'text', text: userContent });
 
-          const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-api-key': apiKey,
-              'anthropic-version': '2023-06-01',
-            },
-            body: JSON.stringify({
-              model: 'claude-sonnet-4-6',
-              max_tokens: 8192,
-              system: systemPrompt,
-              messages: [{ role: 'user', content: messageContent }],
-              stream: true,
-            }),
+          const result = streamText({
+            model,
+            system: systemPrompt,
+            messages: [{ role: 'user', content: messageContent }],
+            maxOutputTokens: 8192,
           });
 
-          if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`API error: ${response.status} - ${errorText}`);
-          }
-
-          const reader = response.body?.getReader();
-          if (!reader) throw new Error('No response body');
-
-          const decoder = new TextDecoder();
-          let buffer = '';
           let accumulatedContent = '';
           let chunkBuffer = '';
           const CHUNK_SIZE = 100;
 
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
+          for await (const text of result.textStream) {
+            accumulatedContent += text;
+            chunkBuffer += text;
 
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-
-            for (const line of lines) {
-              if (!line.startsWith('data: ')) continue;
-              const data = line.slice(6);
-              if (data === '[DONE]') continue;
-
-              try {
-                const event = JSON.parse(data);
-                if (event.type === 'content_block_delta' && event.delta?.text) {
-                  accumulatedContent += event.delta.text;
-                  chunkBuffer += event.delta.text;
-
-                  if (chunkBuffer.length >= CHUNK_SIZE) {
-                    write('content', { text: chunkBuffer, partial: true });
-                    chunkBuffer = '';
-                  }
-                }
-              } catch {
-                // Skip malformed events
-              }
+            if (chunkBuffer.length >= CHUNK_SIZE) {
+              write('content', { text: chunkBuffer, partial: true });
+              chunkBuffer = '';
             }
           }
 
@@ -253,7 +220,10 @@ export async function POST(request: Request) {
             write('content', { text: chunkBuffer, partial: true });
           }
 
-          write('status', { phase: 'finalizing', message: 'Finalizing document...' });
+          write('status', {
+            phase: 'finalizing',
+            message: 'Finalizing document...',
+          });
 
           const latex = extractLatex(accumulatedContent);
 
@@ -266,13 +236,14 @@ export async function POST(request: Request) {
           }
 
           let title = extractTitle(latex);
-          
+
           if (!title) {
             const cleanPrompt = prompt.replace(/\s+/g, ' ').trim();
-            title = cleanPrompt.length > 50 
-              ? cleanPrompt.slice(0, 50) + '...' 
-              : cleanPrompt;
-              
+            title =
+              cleanPrompt.length > 50
+                ? cleanPrompt.slice(0, 50) + '...'
+                : cleanPrompt;
+
             if (!title) title = 'Untitled Document';
           }
 
@@ -296,9 +267,13 @@ export async function POST(request: Request) {
     return new Response(stream, { headers: createSSEHeaders() });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
+    const status = error instanceof AiConfigurationError ? error.status : 500;
     return NextResponse.json(
-      { error: 'Failed to process request', details: message },
-      { status: 500 }
+      {
+        error: status === 500 ? 'Failed to process request' : message,
+        details: message,
+      },
+      { status }
     );
   }
 }
@@ -322,7 +297,8 @@ function extractLatex(content: string): string | null {
     trimmed.includes('\\end{document}')
   ) {
     const start = trimmed.indexOf('\\documentclass');
-    const end = trimmed.lastIndexOf('\\end{document}') + '\\end{document}'.length;
+    const end =
+      trimmed.lastIndexOf('\\end{document}') + '\\end{document}'.length;
     return trimmed.slice(start, end);
   }
 

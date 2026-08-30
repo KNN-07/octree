@@ -1,5 +1,6 @@
 import { useRef, useCallback } from 'react';
 import { StringEdit } from '@/lib/octra-agent/edits';
+import { getAiRequestConfig } from '@/stores/ai-settings';
 
 interface ChatMessage {
   id: string;
@@ -82,6 +83,10 @@ export function useChatStream() {
           projectFiles: projectContext.projectFiles,
           currentFilePath: projectContext.currentFilePath,
           sessionId,
+          aiSettings: {
+            editor: getAiRequestConfig('editor-assistant'),
+            summary: getAiRequestConfig('conversation-summary'),
+          },
         }),
         signal: controller.signal,
       });
@@ -178,7 +183,6 @@ export function useChatStream() {
           }
 
           const dataText = dataLines.join('\n');
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           let payload: any = dataText;
           try {
             payload = JSON.parse(dataText);
@@ -205,9 +209,19 @@ export function useChatStream() {
               callbacks.onTextUpdate(lastAssistantText);
             }
             const name = payload?.name ? String(payload.name) : 'tool';
-            const count = typeof payload?.count === 'number' ? payload.count : undefined;
-            const progressIncrement = typeof payload?.progress === 'number' ? payload.progress : undefined;
-            callbacks.onToolCall(name, count, payload?.violations, progressIncrement, lastAssistantText.length);
+            const count =
+              typeof payload?.count === 'number' ? payload.count : undefined;
+            const progressIncrement =
+              typeof payload?.progress === 'number'
+                ? payload.progress
+                : undefined;
+            callbacks.onToolCall(
+              name,
+              count,
+              payload?.violations,
+              progressIncrement,
+              lastAssistantText.length
+            );
           } else if (eventName === 'error') {
             const errorMsg = payload?.message
               ? String(payload.message)
