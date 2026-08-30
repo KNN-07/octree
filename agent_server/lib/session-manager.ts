@@ -4,7 +4,7 @@
  */
 
 import { generateText } from 'ai';
-import { anthropic } from '@ai-sdk/anthropic';
+import { createAiModel, type AiProviderConfig } from './ai-provider.js';
 
 interface LastInteraction {
   userRequest: string;
@@ -35,11 +35,17 @@ export class SessionManager {
 
   getSession(sessionId: string): SessionState | undefined {
     const session = this.sessions.get(sessionId);
-    console.log(`[Session] getSession(${sessionId}): ${session ? 'FOUND' : 'NOT FOUND'}, mapSize=${this.sessions.size}`);
+    console.log(
+      `[Session] getSession(${sessionId}): ${session ? 'FOUND' : 'NOT FOUND'}, mapSize=${this.sessions.size}`
+    );
     return session;
   }
 
-  storeLastInteraction(sessionId: string, userRequest: string, assistantResponse: string): void {
+  storeLastInteraction(
+    sessionId: string,
+    userRequest: string,
+    assistantResponse: string
+  ): void {
     const existing = this.sessions.get(sessionId);
     this.sessions.set(sessionId, {
       summary: existing?.summary || '',
@@ -50,7 +56,9 @@ export class SessionManager {
       },
       lastUpdated: Date.now(),
     });
-    console.log(`[Session] storeLastInteraction(${sessionId}): stored immediately`);
+    console.log(
+      `[Session] storeLastInteraction(${sessionId}): stored immediately`
+    );
   }
 
   updateSession(sessionId: string, summary: string): void {
@@ -60,14 +68,17 @@ export class SessionManager {
       lastInteraction: existing?.lastInteraction || null,
       lastUpdated: Date.now(),
     });
-    console.log(`[Session] updateSession(${sessionId}): mapSize now=${this.sessions.size}, summaryLength=${summary?.length || 0}`);
+    console.log(
+      `[Session] updateSession(${sessionId}): mapSize now=${this.sessions.size}, summaryLength=${summary?.length || 0}`
+    );
   }
 
   async generateUpdatedSummary(
     sessionId: string,
     currentSummary: string,
     userRequest: string,
-    assistantResponse: string
+    assistantResponse: string,
+    aiConfig: AiProviderConfig
   ): Promise<void> {
     const prompt = `
 You are a technical documentation assistant.
@@ -93,14 +104,20 @@ INSTRUCTIONS:
 
     try {
       const { text } = await generateText({
-        model: anthropic('claude-haiku-4-5-20251001'),
+        model: createAiModel(aiConfig),
         prompt,
       });
 
       this.updateSession(sessionId, text.trim());
-      console.log(`[Session] Updated summary for ${sessionId}:`, text.trim().substring(0, 100) + '...');
+      console.log(
+        `[Session] Updated summary for ${sessionId}:`,
+        text.trim().substring(0, 100) + '...'
+      );
     } catch (error) {
-      console.error(`[Session] Failed to update session summary for ${sessionId}:`, error);
+      console.error(
+        `[Session] Failed to update session summary for ${sessionId}:`,
+        error
+      );
     }
   }
 }

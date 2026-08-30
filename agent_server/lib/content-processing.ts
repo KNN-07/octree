@@ -45,7 +45,10 @@ export function filterProjectFilesIntelligently(
   }
 
   if (projectFiles.length <= MAX_FULL_CONTENT_FILES) {
-    const totalSize = projectFiles.reduce((sum, f) => sum + f.content.length, 0);
+    const totalSize = projectFiles.reduce(
+      (sum, f) => sum + f.content.length,
+      0
+    );
     if (totalSize <= MAX_TOTAL_CONTENT_SIZE) {
       return { fullContentFiles: projectFiles, summaryFiles: [] };
     }
@@ -55,17 +58,23 @@ export function filterProjectFilesIntelligently(
   const summaryFiles: string[] = [];
   let totalSize = 0;
 
-  const currentFile = projectFiles.find(f => f.path === currentFilePath);
+  const currentFile = projectFiles.find((f) => f.path === currentFilePath);
   if (currentFile) {
     fullContentFiles.push(currentFile);
     totalSize += currentFile.content.length;
   }
 
-  const mainFileNames = ['main.tex', 'document.tex', 'paper.tex', 'thesis.tex', 'report.tex'];
+  const mainFileNames = [
+    'main.tex',
+    'document.tex',
+    'paper.tex',
+    'thesis.tex',
+    'report.tex',
+  ];
   for (const mainName of mainFileNames) {
     if (totalSize >= MAX_TOTAL_CONTENT_SIZE) break;
-    const mainFile = projectFiles.find(f =>
-      f.path === mainName && f.path !== currentFilePath
+    const mainFile = projectFiles.find(
+      (f) => f.path === mainName && f.path !== currentFilePath
     );
     if (mainFile && !fullContentFiles.includes(mainFile)) {
       fullContentFiles.push(mainFile);
@@ -77,10 +86,11 @@ export function filterProjectFilesIntelligently(
     const referencedPaths = extractReferencedFiles(currentFile.content);
     for (const refPath of referencedPaths) {
       if (totalSize >= MAX_TOTAL_CONTENT_SIZE) break;
-      const refFile = projectFiles.find(f =>
-        f.path === refPath ||
-        f.path.endsWith(`/${refPath}`) ||
-        f.path.endsWith(refPath)
+      const refFile = projectFiles.find(
+        (f) =>
+          f.path === refPath ||
+          f.path.endsWith(`/${refPath}`) ||
+          f.path.endsWith(refPath)
       );
       if (refFile && !fullContentFiles.includes(refFile)) {
         fullContentFiles.push(refFile);
@@ -89,8 +99,8 @@ export function filterProjectFilesIntelligently(
     }
   }
 
-  const bibFiles = projectFiles.filter(f =>
-    f.path.endsWith('.bib') && !fullContentFiles.includes(f)
+  const bibFiles = projectFiles.filter(
+    (f) => f.path.endsWith('.bib') && !fullContentFiles.includes(f)
   );
   for (const bibFile of bibFiles) {
     if (totalSize >= MAX_TOTAL_CONTENT_SIZE) break;
@@ -107,7 +117,10 @@ export function filterProjectFilesIntelligently(
   return { fullContentFiles, summaryFiles };
 }
 
-export async function buildNumberedContent(fileContent: string, textFromEditor?: string | null): Promise<string> {
+export async function buildNumberedContent(
+  fileContent: string,
+  textFromEditor?: string | null
+): Promise<string> {
   return new Promise((resolve) => {
     setImmediate(() => {
       const lines = fileContent.split('\n');
@@ -128,7 +141,10 @@ export async function buildNumberedContent(fileContent: string, textFromEditor?:
         .join('\n');
       const endLines = lines
         .slice(-LINES_PER_SECTION)
-        .map((line, index) => `${lines.length - LINES_PER_SECTION + index + 1}: ${line}`)
+        .map(
+          (line, index) =>
+            `${lines.length - LINES_PER_SECTION + index + 1}: ${line}`
+        )
         .join('\n');
 
       let numbered = `${startLines}\n\n... [${lines.length - LINES_PER_SECTION * 2} lines omitted] ...\n\n${endLines}`;
@@ -142,17 +158,6 @@ export async function buildNumberedContent(fileContent: string, textFromEditor?:
 
 export function normalizeLineEndings(text: string): string {
   return text.split('\r\n').join('\n').split('\r').join('\n');
-}
-
-export function validateApiKeys(): { isValid: boolean; error?: string } {
-  const hasAnthropic = !!process.env.ANTHROPIC_API_KEY;
-  if (!hasAnthropic) {
-    return {
-      isValid: false,
-      error: 'No Anthropic API key configured. Please set ANTHROPIC_API_KEY.',
-    };
-  }
-  return { isValid: true };
 }
 
 /**
@@ -170,10 +175,14 @@ export function buildSystemPrompt(
   const validProjectFiles =
     projectFiles?.filter(
       (file): file is ProjectFileContext =>
-        !!file && typeof file.path === 'string' && typeof file.content === 'string'
+        !!file &&
+        typeof file.path === 'string' &&
+        typeof file.content === 'string'
     ) ?? [];
 
-  const otherFiles = validProjectFiles.filter(f => f.path !== currentFilePath);
+  const otherFiles = validProjectFiles.filter(
+    (f) => f.path !== currentFilePath
+  );
 
   let projectSection = '';
   if (otherFiles.length > 0) {
@@ -183,23 +192,30 @@ export function buildSystemPrompt(
     );
 
     if (fullContentFiles.length > 0) {
-      const fileBlocks = fullContentFiles.map(f => {
-        const numbered = f.content.split('\n').map((line, idx) => `${idx + 1}: ${line}`).join('\n');
-        return `--- ${f.path} ---\n${numbered}\n--- end ${f.path} ---`;
-      }).join('\n\n');
+      const fileBlocks = fullContentFiles
+        .map((f) => {
+          const numbered = f.content
+            .split('\n')
+            .map((line, idx) => `${idx + 1}: ${line}`)
+            .join('\n');
+          return `--- ${f.path} ---\n${numbered}\n--- end ${f.path} ---`;
+        })
+        .join('\n\n');
       projectSection = `\n\nOTHER PROJECT FILES:\n${fileBlocks}`;
     }
 
     if (summaryFiles.length > 0) {
-      projectSection += `\n\nAdditional files available (use get_context tool to fetch content before editing):\n${summaryFiles.map(path => `- ${path}`).join('\n')}`;
+      projectSection += `\n\nAdditional files available (use get_context tool to fetch content before editing):\n${summaryFiles.map((path) => `- ${path}`).join('\n')}`;
     }
   }
 
   const hasMultipleFiles = validProjectFiles.length > 1;
-  const multiFileInstructions = hasMultipleFiles ? `\n\nMULTI-FILE PROJECTS:
+  const multiFileInstructions = hasMultipleFiles
+    ? `\n\nMULTI-FILE PROJECTS:
 - The currently open file is: ${currentFilePath || 'unknown'}
 - To edit OTHER files: First call get_context to see the file's content, then use the edit tool with the correct file_path.
-- ALWAYS specify the correct file_path for each edit.` : '';
+- ALWAYS specify the correct file_path for each edit.`
+    : '';
 
   let sessionContext = '';
   if (sessionSummary || lastInteraction) {

@@ -1,3 +1,5 @@
+import { getAiRequestConfig } from '@/stores/ai-settings';
+
 /**
  * Image Content Extractor
  * Uses GPT-4o-mini to describe image content before sending to Claude
@@ -28,13 +30,15 @@ export async function convertImageToLatex(
       body: JSON.stringify({
         image: imageDataUrl,
         fileName,
+        aiSettings: getAiRequestConfig('image-analysis'),
       }),
     });
 
     if (!response.ok) {
+      const message = await response.text();
       return {
         success: false,
-        error: `Failed to convert image: ${response.statusText}`,
+        error: message || `Failed to analyze image (${response.status})`,
       };
     }
 
@@ -83,4 +87,3 @@ export async function convertImagesToLatex(
 
   return results;
 }
-

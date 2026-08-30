@@ -3,10 +3,13 @@ import express from 'express';
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import { streamText, stepCountIs } from 'ai';
-import { anthropic } from '@ai-sdk/anthropic';
+import {
+  AiConfigurationError,
+  createAiModel,
+  parseAiProviderConfig,
+} from './lib/ai-provider.js';
 
 import {
-  validateApiKeys,
   buildNumberedContent,
   buildSystemPrompt,
 } from './lib/content-processing.js';
@@ -20,7 +23,9 @@ import { SessionManager } from './lib/session-manager.js';
 const SUPABASE_JWT_SECRET: string = (() => {
   const s = process.env.SUPABASE_JWT_SECRET;
   if (!s) {
-    console.error('[FATAL] SUPABASE_JWT_SECRET is not set. Refusing to start to prevent unauthenticated /agent access.');
+    console.error(
+      '[FATAL] SUPABASE_JWT_SECRET is not set. Refusing to start to prevent unauthenticated /agent access.'
+    );
     process.exit(1);
   }
   return s;
@@ -30,7 +35,11 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-function jwtAuthMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
+function jwtAuthMiddleware(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
   const authHeader = req.headers.authorization;
   if (!authHeader) {
     res.status(401).json({ error: 'Authorization header required' });
@@ -53,136 +62,211 @@ function jwtAuthMiddleware(req: express.Request, res: express.Response, next: ex
   }
 }
 
-app.post('/agent', jwtAuthMiddleware, async (req: express.Request, res: express.Response) => {
-  try {
-    const keyValidation = validateApiKeys();
-    if (!keyValidation.isValid) {
-      res.status(503).json({ error: keyValidation.error });
-      return;
+app.post(
+  '/agent',
+  jwtAuthMiddleware,
+  async (req: express.Request, res: express.Response) => {
+    try {
+      const {
+        messages,
+        fileContent,
+        textFromEditor,
+        selectionRange,
+        projectFiles: projectFilesPayload,
+        currentFilePath,
+        sessionId,
+        aiSettings,
+      } = req.body || {};
+
+      if (!messages?.length || typeof fileContent !== 'string') {
+        res.status(400).json({ error: 'Invalid request' });
+        return;
+      }
+
+      let editorConfig;
+      let summaryConfig;
+      try {
+        editorConfig = parseAiProviderConfig(aiSettings?.editor, {
+          provider: 'anthropic',
+          model: 'claude-haiku-4-5-20251001',
+        });
+        summaryConfig = parseAiProviderConfig(aiSettings?.summary, {
+          provider: 'anthropic',
+          model: 'claude-haiku-4-5-20251001',
+        });
+      } catch (error) {
+        if (error instanceof AiConfigurationError) {
+          res.status(error.status).json({ error: error.message });
+          return;
+        }
+        throw error;
+      }
+
+      const editorModel = createAiModel(editorConfig);
+
+      const numbered = await buildNumberedContent(fileContent, textFromEditor);
+      const userText =
+        typeof messages[messages.length - 1]?.content === 'string'
+          ? messages[messages.length - 1].content
+          : '';
+      const intent = await inferIntent(userText);
+      const collectedEdits: StringEdit[] = [];
+
+      const binaryExtensions = [
+        '.pdf',
+        '.png',
+        '.jpg',
+        '.jpeg',
+        '.gif',
+        '.bmp',
+        '.svg',
+        '.eps',
+        '.ps',
+        '.dvi',
+        '.aux',
+        '.log',
+        '.out',
+        '.toc',
+        '.lof',
+        '.lot',
+        '.bbl',
+        '.blg',
+        '.synctex',
+        '.fls',
+        '.fdb_latexmk',
+        '.gz',
+      ];
+
+      const projectFiles: ProjectFileContext[] = Array.isArray(
+        projectFilesPayload
+      )
+        ? projectFilesPayload
+            .filter(
+              (file: unknown): file is { path: string; content: string } =>
+                !!file &&
+                typeof (file as { path?: unknown }).path === 'string' &&
+                typeof (file as { content?: unknown }).content === 'string'
+            )
+            .filter((file) => {
+              const ext = file.path
+                .toLowerCase()
+                .substring(file.path.lastIndexOf('.'));
+              return !binaryExtensions.includes(ext);
+            })
+            .map((file) => ({
+              path: file.path,
+              content: file.content,
+            }))
+        : [];
+
+      const normalizedCurrentFilePath =
+        typeof currentFilePath === 'string' ? currentFilePath : null;
+
+      // Set SSE headers
+      const headers = createSSEHeaders();
+      for (const [key, value] of Object.entries(headers)) {
+        res.setHeader(key, value);
+      }
+
+      const writeEvent = (event: string, data: unknown) => {
+        res.write(`event: ${event}\n`);
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      // Extract auth token for compile service
+      const authHeader = req.headers.authorization;
+      const authToken = authHeader?.startsWith('Bearer ')
+        ? authHeader.slice(7)
+        : null;
+
+      const tools = createOctraTools({
+        fileContent,
+        numberedContent: numbered,
+        textFromEditor,
+        selectionRange,
+        collectedEdits,
+        intent,
+        writeEvent,
+        projectFiles,
+        currentFilePath: normalizedCurrentFilePath,
+        compileServiceUrl: process.env.COMPILE_SERVICE_URL || null,
+        authToken,
+      });
+
+      const sessionManager = SessionManager.getInstance();
+      const currentSession = sessionId
+        ? sessionManager.getSession(sessionId)
+        : undefined;
+      const sessionSummary = currentSession?.summary || null;
+      const lastInteraction = currentSession?.lastInteraction || null;
+
+      console.log('[Session] sessionId:', sessionId || '(none)');
+      console.log(
+        '[Session] hasSummary:',
+        !!sessionSummary,
+        'hasLastInteraction:',
+        !!lastInteraction
+      );
+
+      const systemPrompt = buildSystemPrompt(
+        numbered,
+        textFromEditor,
+        selectionRange,
+        projectFiles,
+        normalizedCurrentFilePath,
+        sessionSummary,
+        lastInteraction
+      );
+
+      writeEvent('status', { state: 'started' });
+
+      const result = streamText({
+        model: editorModel,
+        system: systemPrompt,
+        prompt: userText,
+        tools,
+        stopWhen: stepCountIs(25),
+        maxOutputTokens: 16384,
+      });
+
+      const finalText = await processFullStream(
+        result.fullStream,
+        writeEvent,
+        collectedEdits
+      );
+
+      if (sessionId) {
+        sessionManager.storeLastInteraction(sessionId, userText, finalText);
+        console.log('[Session] Generating updated summary for:', sessionId);
+        sessionManager
+          .generateUpdatedSummary(
+            sessionId,
+            sessionSummary || '',
+            userText,
+            finalText,
+            summaryConfig
+          )
+          .catch(console.error);
+      } else {
+        console.log(
+          '[Session] No sessionId provided - skipping session update'
+        );
+      }
+
+      writeEvent('done', { text: finalText, edits: collectedEdits });
+      res.end();
+    } catch (e: unknown) {
+      if (e instanceof AiConfigurationError && !res.headersSent) {
+        res.status(e.status).json({ error: e.message });
+        return;
+      }
+      const message = e instanceof Error ? e.message : 'internal error';
+      res.write(`event: error\n`);
+      res.write(`data: ${JSON.stringify({ message })}\n\n`);
+      res.end();
     }
-
-    const {
-      messages,
-      fileContent,
-      textFromEditor,
-      selectionRange,
-      projectFiles: projectFilesPayload,
-      currentFilePath,
-      sessionId,
-    } = req.body || {};
-
-    if (!messages?.length || typeof fileContent !== 'string') {
-      res.status(400).json({ error: 'Invalid request' });
-      return;
-    }
-
-    const numbered = await buildNumberedContent(fileContent, textFromEditor);
-    const userText = typeof messages[messages.length - 1]?.content === 'string'
-      ? messages[messages.length - 1].content
-      : '';
-    const intent = await inferIntent(userText);
-    const collectedEdits: StringEdit[] = [];
-
-    const binaryExtensions = ['.pdf', '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.eps', '.ps', '.dvi', '.aux', '.log', '.out', '.toc', '.lof', '.lot', '.bbl', '.blg', '.synctex', '.fls', '.fdb_latexmk', '.gz'];
-
-    const projectFiles: ProjectFileContext[] = Array.isArray(projectFilesPayload)
-      ? projectFilesPayload
-        .filter(
-          (file: unknown): file is { path: string; content: string } =>
-            !!file &&
-            typeof (file as { path?: unknown }).path === 'string' &&
-            typeof (file as { content?: unknown }).content === 'string'
-        )
-        .filter((file) => {
-          const ext = file.path.toLowerCase().substring(file.path.lastIndexOf('.'));
-          return !binaryExtensions.includes(ext);
-        })
-        .map((file) => ({
-          path: file.path,
-          content: file.content,
-        }))
-      : [];
-
-    const normalizedCurrentFilePath =
-      typeof currentFilePath === 'string' ? currentFilePath : null;
-
-    // Set SSE headers
-    const headers = createSSEHeaders();
-    for (const [key, value] of Object.entries(headers)) {
-      res.setHeader(key, value);
-    }
-
-    const writeEvent = (event: string, data: unknown) => {
-      res.write(`event: ${event}\n`);
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
-    };
-
-    // Extract auth token for compile service
-    const authHeader = req.headers.authorization;
-    const authToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
-
-    const tools = createOctraTools({
-      fileContent,
-      numberedContent: numbered,
-      textFromEditor,
-      selectionRange,
-      collectedEdits,
-      intent,
-      writeEvent,
-      projectFiles,
-      currentFilePath: normalizedCurrentFilePath,
-      compileServiceUrl: process.env.COMPILE_SERVICE_URL || null,
-      authToken,
-    });
-
-    const sessionManager = SessionManager.getInstance();
-    const currentSession = sessionId ? sessionManager.getSession(sessionId) : undefined;
-    const sessionSummary = currentSession?.summary || null;
-    const lastInteraction = currentSession?.lastInteraction || null;
-
-    console.log('[Session] sessionId:', sessionId || '(none)');
-    console.log('[Session] hasSummary:', !!sessionSummary, 'hasLastInteraction:', !!lastInteraction);
-
-    const systemPrompt = buildSystemPrompt(
-      numbered,
-      textFromEditor,
-      selectionRange,
-      projectFiles,
-      normalizedCurrentFilePath,
-      sessionSummary,
-      lastInteraction
-    );
-
-    writeEvent('status', { state: 'started' });
-
-    const result = streamText({
-      model: anthropic('claude-haiku-4-5-20251001'),
-      system: systemPrompt,
-      prompt: userText,
-      tools,
-      stopWhen: stepCountIs(25),
-      maxOutputTokens: 16384,
-    });
-
-    const finalText = await processFullStream(result.fullStream, writeEvent, collectedEdits);
-
-    if (sessionId) {
-      sessionManager.storeLastInteraction(sessionId, userText, finalText);
-      console.log('[Session] Generating updated summary for:', sessionId);
-      sessionManager.generateUpdatedSummary(sessionId, sessionSummary || '', userText, finalText).catch(console.error);
-    } else {
-      console.log('[Session] No sessionId provided - skipping session update');
-    }
-
-    writeEvent('done', { text: finalText, edits: collectedEdits });
-    res.end();
-  } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : 'internal error';
-    res.write(`event: error\n`);
-    res.write(`data: ${JSON.stringify({ message })}\n\n`);
-    res.end();
   }
-});
+);
 
 const PORT = process.env.PORT || 8787;
 app.listen(PORT, () => console.log(`Agent service listening on :${PORT}`));

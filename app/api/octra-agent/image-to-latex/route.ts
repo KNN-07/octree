@@ -1,106 +1,105 @@
+import { streamText } from 'ai';
 import { NextRequest } from 'next/server';
+import {
+  AiConfigurationError,
+  createAiModel,
+  parseAiProviderConfig,
+} from '@/lib/ai/provider';
+import { createClient } from '@/lib/supabase/server';
+
+const MAX_IMAGE_DATA_LENGTH = 7 * 1024 * 1024;
+const IMAGE_DATA_URL =
+  /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=]+)$/;
+
+interface ImageAnalysisRequest {
+  image?: unknown;
+  fileName?: unknown;
+  aiSettings?: unknown;
+}
 
 export async function POST(request: NextRequest) {
   try {
-    const { image, fileName } = await request.json();
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
 
-    if (!image) {
+    if (!user) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+
+    const body = (await request.json()) as ImageAnalysisRequest;
+    if (typeof body.image !== 'string') {
       return new Response('Image is required', { status: 400 });
     }
-
-    // Call OpenAI Vision API with GPT-4o-mini
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY || ''}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: `Describe everything you see in this image. If there are mathematical expressions, equations, or formulas, transcribe them clearly. If it's handwritten, convert to readable text. Be concise but accurate.
-
-Image: ${fileName || 'image'}`,
-              },
-              {
-                type: 'image_url',
-                image_url: {
-                  url: image,
-                },
-              },
-            ],
-          },
-        ],
-        max_tokens: 2000,
-        stream: true,
-      }),
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json();
-      console.error('OpenAI API error:', errorData);
-      
-      return new Response('Failed to process image', { status: 500 });
+    if (body.image.length > MAX_IMAGE_DATA_LENGTH) {
+      return new Response('Image is too large', { status: 413 });
     }
 
-    const reader = response.body?.getReader();
-    const decoder = new TextDecoder();
-    const encoder = new TextEncoder();
+    const imageMatch = body.image.match(IMAGE_DATA_URL);
+    if (!imageMatch) {
+      return new Response('Image must be a supported base64 data URL', {
+        status: 400,
+      });
+    }
 
+    const aiConfig = parseAiProviderConfig(body.aiSettings, {
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+    });
+    const fileName =
+      typeof body.fileName === 'string'
+        ? body.fileName.replace(/[\r\n]/g, ' ').slice(0, 200)
+        : 'image';
+
+    const result = streamText({
+      model: createAiModel(aiConfig),
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: `Describe everything you see in this image. If there are mathematical expressions, equations, or formulas, transcribe them clearly. If it is handwritten, convert it to readable text. Be concise but accurate.\n\nImage: ${fileName}`,
+            },
+            {
+              type: 'image',
+              image: imageMatch[2],
+              mediaType: imageMatch[1],
+            },
+          ],
+        },
+      ],
+      maxOutputTokens: 2000,
+    });
+
+    const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
-        if (!reader) {
-          controller.close();
-          return;
-        }
-
         try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split('\n');
-
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                const data = line.slice(6);
-                if (data === '[DONE]') continue;
-
-                try {
-                  const parsed = JSON.parse(data);
-                  const content = parsed.choices[0]?.delta?.content;
-                  if (content) {
-                    controller.enqueue(encoder.encode(content));
-                  }
-                } catch (e) {
-                  // Skip invalid JSON
-                }
-              }
-            }
+          for await (const text of result.textStream) {
+            controller.enqueue(encoder.encode(text));
           }
-        } catch (error) {
-          console.error('Stream error:', error);
-        } finally {
           controller.close();
+        } catch (error) {
+          controller.error(error);
         }
       },
     });
 
     return new Response(stream, {
       headers: {
-        'Content-Type': 'text/plain',
-        'Cache-Control': 'no-cache',
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
       },
     });
   } catch (error) {
-    console.error('Image to LaTeX conversion error:', error);
-    return new Response('Internal server error', { status: 500 });
+    console.error('Image analysis error:', error);
+    const status = error instanceof AiConfigurationError ? error.status : 500;
+    const message =
+      error instanceof Error ? error.message : 'Internal server error';
+    return new Response(status === 500 ? 'Internal server error' : message, {
+      status,
+    });
   }
 }
-
